@@ -380,6 +380,12 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
 /// runtime's; another allocator committing it before the first take would
 /// have it guarded.
 fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast = *FAST.get_or_init(|| std::env::var_os("VICTORY_WATCH_REGION_PROBE").is_some_and(|v| v == "1"));
+    runtime_pages_with_probe(start, end, views, fast)
+}
+
+fn runtime_pages_with_probe(start: usize, end: usize, views: bool, fast: bool) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -389,6 +395,43 @@ fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
         unsafe { GetWriteWatch(0, at as *const _, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
     };
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // Query allocation metadata rather than walking the page protections.
+    // Only a fully committed private allocation covering the entire range
+    // is eligible. MEM_WRITE_WATCH is a property of the reservation; the
+    // short probe must succeed. Nothing is cached across calls.
+    let aligned = start & !(4096 - 1);
+    if fast && end.saturating_sub(aligned) >= 16 * 1024 * 1024 {
+        use windows_sys::Win32::System::Memory::{
+            MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+        // SAFETY: current-process pseudo-handle, valid output structure and
+        // size; querying an invalid address fails without dereferencing it.
+        let queried = unsafe {
+            QueryVirtualMemoryInformation(
+                GetCurrentProcess(),
+                aligned as *const _,
+                MemoryRegionInfo,
+                (&raw mut info).cast(),
+                size_of_val(&info),
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: Flags is the integer representation of the documented
+        // union, whose low bit identifies private allocations.
+        let private = unsafe { info.Anonymous.Flags & 1 != 0 };
+        let base = info.AllocationBase as usize;
+        if queried != 0
+            && private
+            && info.CommitSize == info.RegionSize
+            && base <= aligned
+            && base.checked_add(info.RegionSize).is_some_and(|limit| end <= limit)
+            && watched(aligned, 4096)
+        {
+            return (first..last).collect();
+        }
+    }
     // One pool holds it all (the common case; asking `VirtualQuery` costs
     // milliseconds in the runtime's big pools).
     if watched(start & !(4096 - 1), end - (start & !(4096 - 1))) {
@@ -980,6 +1023,150 @@ pub(crate) mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    #[test]
+    fn region_probe_matches_baseline_after_address_reuse() {
+        const N: usize = 256;
+        let p = pool(N);
+        let check = |p: usize| {
+            for views in [false, true] {
+                assert_eq!(
+                    runtime_pages_with_probe(p, p + N * PAGE, views, true),
+                    runtime_pages_with_probe(p, p + N * PAGE, views, false)
+                );
+            }
+        };
+        check(p);
+        free(p);
+        // SAFETY: reserve a fresh plain allocation at the old address when
+        // possible. Other parallel tests may have taken that address.
+        let q = unsafe {
+            VirtualAlloc(p as *const _, N * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        let q = if q == 0 {
+            // SAFETY: a new allocation owned by this test.
+            (unsafe {
+                VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+            }) as usize
+        } else {
+            q
+        };
+        assert_ne!(q, 0);
+        check(q);
+        assert!(runtime_pages_with_probe(q, q + N * PAGE, false, true).is_empty());
+        free(q);
+    }
+
+    #[test]
+    fn region_probe_matches_baseline_across_protections() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        let p = pool(512);
+        let mut old = 0;
+        // SAFETY: the middle page belongs to this allocation.
+        assert_ne!(unsafe { VirtualProtect((p + 64 * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old) }, 0);
+        for views in [false, true] {
+            assert_eq!(
+                runtime_pages_with_probe(p, p + 512 * PAGE, views, true),
+                runtime_pages_with_probe(p, p + 512 * PAGE, views, false)
+            );
+        }
+        free(p);
+    }
+
+    #[test]
+    fn region_probe_matches_baseline_for_dirty_and_partial_ranges() {
+        for n in [1, 63, 64, 65, 128, 512] {
+            let p = pool(n);
+            for page in 0..n {
+                // SAFETY: each address lies in the test's committed allocation.
+                unsafe { ((p + page * PAGE) as *mut u8).write_volatile(1) };
+            }
+            for (start, end) in [(p, p + n * PAGE), (p + 17, p + n * PAGE - 19)] {
+                for views in [false, true] {
+                    assert_eq!(
+                        runtime_pages_with_probe(start, end, views, true),
+                        runtime_pages_with_probe(start, end, views, false),
+                        "dirty range {n} pages, views={views}"
+                    );
+                }
+            }
+            free(p);
+        }
+    }
+
+    #[test]
+    fn region_probe_matches_baseline_for_mixed_commit_states() {
+        // SAFETY: a fresh write-watched reservation owned by this test.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 256 * PAGE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        for offset in [0, 128 * PAGE] {
+            // SAFETY: commit only inside the reservation.
+            assert_ne!(unsafe {
+                VirtualAlloc((p + offset) as *const _, 64 * PAGE, MEM_COMMIT, PAGE_READWRITE)
+            } as usize, 0);
+        }
+        for views in [false, true] {
+            assert_eq!(
+                runtime_pages_with_probe(p, p + 256 * PAGE, views, true),
+                runtime_pages_with_probe(p, p + 256 * PAGE, views, false)
+            );
+        }
+        free(p);
+    }
+
+    #[test]
+    fn region_probe_does_not_reset_write_watch() {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        let p = pool(256);
+        // SAFETY: the last page belongs to this committed allocation.
+        unsafe { ((p + 255 * PAGE) as *mut u8).write_volatile(1) };
+        let query = || {
+            let (mut address, mut count, mut granularity) = (0usize, 1usize, 0u32);
+            // SAFETY: one output slot, valid committed write-watched range, no reset.
+            let status = unsafe {
+                GetWriteWatch(0, p as *const _, 256 * PAGE, (&raw mut address).cast(), &mut count, &mut granularity)
+            };
+            (status, count, address)
+        };
+        let before = query();
+        assert_eq!(before, (0, 1, p + 255 * PAGE));
+        assert_eq!(
+            runtime_pages_with_probe(p, p + 256 * PAGE, false, true),
+            runtime_pages_with_probe(p, p + 256 * PAGE, false, false)
+        );
+        assert_eq!(query(), before);
+        free(p);
+    }
+
+    #[test]
+    #[ignore = "manual synthetic timing; no fixed speedup assertion"]
+    fn region_probe_benchmark() {
+        for n in [16, 64, 256, 1024, 4096] {
+            let p = pool(n);
+            for dirty in [false, true] {
+                if dirty {
+                    for page in 0..n {
+                        // SAFETY: each address lies inside the committed allocation.
+                        unsafe { ((p + page * PAGE) as *mut u8).write_volatile(1) };
+                    }
+                }
+                assert_eq!(
+                    runtime_pages_with_probe(p, p + n * PAGE, false, true),
+                    runtime_pages_with_probe(p, p + n * PAGE, false, false)
+                );
+                for fast in [false, true, true, false] {
+                    let start = std::time::Instant::now();
+                    for _ in 0..100 {
+                        std::hint::black_box(runtime_pages_with_probe(p, p + n * PAGE, false, fast));
+                    }
+                    eprintln!("region probe pages={n} dirty={dirty} fast={fast}: {:?}", start.elapsed());
+                }
+            }
+            free(p);
+        }
+    }
+
     /// Everything is changed at first; after taking, only what is written
     /// (by faults, or reported) is, and every tracker of a page sees it.
     #[test]
@@ -1023,8 +1210,8 @@ pub(crate) mod tests {
     #[test]
     fn a_range_over_foreign_memory_guards_only_the_runtimes() {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
-        const WINDOW: usize = 4 << 20;
-        // In a free 4 MiB-aligned window: plain committed memory (as the
+        const WINDOW: usize = 16 << 20;
+        // In a free 16 MiB-aligned window: plain committed memory (as the
         // process heap's) 1 MiB in, a pool 2 MiB in. Other tests allocate
         // meanwhile, so a window taken under our feet is tried again.
         let (base, foreign, pool) = (0..8)
@@ -1047,6 +1234,12 @@ pub(crate) mod tests {
                 }
             })
             .expect("a free window");
+        for views in [false, true] {
+            assert_eq!(
+                runtime_pages_with_probe(base, base + WINDOW, views, true),
+                runtime_pages_with_probe(base, base + WINDOW, views, false)
+            );
+        }
         let t = track(base, WINDOW, true).expect("the pool is tracked");
         let taken = t.take(base, base + WINDOW);
         assert!(taken.iter().any(|&(a, b)| a <= pool && pool + PAGE <= b), "{taken:x?}");
